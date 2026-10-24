@@ -1,0 +1,208 @@
+# syntax=docker/dockerfile:1
+###############################################################################
+# Ubuntu 24.04 — Linux kernel + Rust development image (amd64 / arm64)
+#
+#   - Native build on Apple Silicon (linux/arm64) and on x86_64 hosts.
+#   - Full kernel build deps (GCC 13 + LLVM 18, pahole/BTF, menuconfig, ...)
+#   - Kernel patch workflow: git send-email + msmtp, quilt, b4, checkpatch
+#   - Code navigation: ctags/cscope/global; ripgrep/fd/fzf/bat
+#   - Rust: rustup (stable) + rust-src/rustfmt/clippy/rust-analyzer + bindgen
+#   - QEMU + busybox-static: build a minimal initramfs and boot test kernels
+#   - Userland debugging: strace/ltrace/valgrind/gdb/trace-cmd
+###############################################################################
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+
+# Set automatically by BuildKit: "amd64" or "arm64"
+ARG TARGETARCH
+
+# Non-root user. UID/GID matter mainly on Linux hosts; Docker Desktop on
+# macOS maps bind-mount ownership transparently, so the defaults are fine.
+ARG USERNAME=dev
+ARG UID=1000
+ARG GID=1000
+
+# --- Core kernel build dependencies --------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl wget \
+        rsync perl pkg-config openssl patch \
+        python3 python3-dev python3-pip python3-venv \
+        build-essential gcc-13-plugin-dev \
+        bc bison flex cpio kmod \
+        libncurses-dev libssl-dev libelf-dev \
+        dwarves device-tree-compiler \
+        zstd lz4 xz-utils bzip2 \
+        fakeroot ccache \
+        sparse coccinelle \
+        zlib1g-dev libzstd-dev libcap-dev libnuma-dev libaudit-dev \
+        binutils-dev libunwind-dev libslang2-dev \
+        libtraceevent-dev libtracefs-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# gcc-multilib (32-bit x86 support) — only exists / only useful on amd64
+RUN if [ "${TARGETARCH}" = "amd64" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends gcc-multilib; \
+    fi && rm -rf /var/lib/apt/lists/*
+
+# --- LLVM/Clang: alternative kernel compiler, BPF, bindgen backend --------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang clang-format clangd-18 \
+        lld lldb \
+        llvm libclang-dev \
+    && ln -s /usr/bin/clangd-18 /usr/local/bin/clangd \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Debugging, tracing, VM testing ---------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gdb gdb-multiarch trace-cmd qemu-utils \
+        strace ltrace valgrind elfutils numactl \
+        busybox-static \
+        $(if [ "${TARGETARCH}" = "amd64" ]; then \
+              echo qemu-system-x86; \
+          else \
+              echo qemu-system-arm qemu-system-misc; \
+          fi) \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Editors, VCS, code navigation, shell conveniences ---------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git git-email tig git-delta quilt b4 diffstat colordiff \
+        openssh-client msmtp-mta \
+        vim neovim universal-ctags cscope global \
+        tmux less file tree jq shellcheck \
+        ripgrep fd-find fzf bat \
+        htop procps psmisc iproute2 iputils-ping socat \
+        unzip p7zip-full \
+        man-db manpages manpages-dev \
+        bash-completion sudo gnupg mc \
+    && ln -s /usr/bin/batcat /usr/local/bin/bat \
+    && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Optional extras (uncomment what you need) ------------------------------------
+# KUnit/kselftest link-time deps:   libmnl-dev libcap-ng-dev libaio-dev
+# GNU cross toolchains (clang already cross-builds kernels via `make LLVM=1`):
+#RUN if [ "${TARGETARCH}" = "amd64" ]; then \
+#        apt-get update && apt-get install -y --no-install-recommends \
+#            crossbuild-essential-arm64 gcc-riscv64-linux-gnu; \
+#    else \
+#        apt-get update && apt-get install -y --no-install-recommends \
+#            gcc-x86-64-linux-gnu gcc-riscv64-linux-gnu; \
+#    fi \
+#    && rm -rf /var/lib/apt/lists/*
+# Boot x86_64 guests on an arm64 host (pure emulation — slow):
+#RUN apt-get update && apt-get install -y --no-install-recommends qemu-system-x86 \
+#    && rm -rf /var/lib/apt/lists/*
+# `make xconfig` (Qt GUI):
+#RUN apt-get update && apt-get install -y --no-install-recommends \
+#        qt6-base-dev qt6-base-dev-tools && rm -rf /var/lib/apt/lists/*
+# Kernel documentation builds:
+#RUN pip3 install --break-system-packages sphinx sphinx_rtd_theme
+
+# --- Non-root user -----------------------------------------------------------------
+RUN groupmod -n ${USERNAME} ubuntu \
+ && usermod -l ${USERNAME} -d /home/${USERNAME} -m ubuntu \
+ && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} \
+ && chmod 0440 /etc/sudoers.d/${USERNAME} \
+ && mkdir -p /workspace && chown ${UID}:${GID} /workspace
+
+#RUN groupadd --gid ${GID} ${USERNAME} \
+# && useradd --uid ${UID} --gid ${GID} --create-home --shell /bin/bash ${USERNAME} \
+# && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} \
+# && chmod 0440 /etc/sudoers.d/${USERNAME} \
+# && mkdir -p /workspace && chown ${UID}:${GID} /workspace
+
+USER ${USERNAME}
+WORKDIR /home/${USERNAME}
+
+# --- Kernel-friendly editor/VCS defaults -------------------------------------------
+# .vimrc — follows Documentation/process/coding-style.rst conventions
+RUN cat > ~/.vimrc <<'EOF'
+" Kernel coding style: tabs are 8, no expandtab, 80-col
+set encoding=utf-8
+set ts=8 sts=8 sw=8 noexpandtab
+set textwidth=80
+set cindent cinoptions=:0,l1,t0,g0
+syntax on
+filetype plugin indent on
+set number
+set incsearch hlsearch ignorecase smartcase
+" Highlight tabs/trailing whitespace (kernel style forbids both in new code)
+set list listchars=tab:>-·,trail:·
+" cscope: run `make cscope` in the kernel tree, then
+"   :cs find g <symbol>   definition
+"   :cs find c <symbol>   callers
+if has("cscope")
+    set cscopetag csto=0
+endif
+EOF
+
+# .gitconfig — delta as pager; fill in [user] and sendemail yourself
+RUN cat > ~/.gitconfig <<'EOF'
+[core]
+    pager = delta
+[interactive]
+    diffFilter = delta --color-only
+[delta]
+    line-numbers = true
+[alias]
+    lg = log --oneline --graph --decorate
+#[user]
+#    name = Artem Kuzin
+#    email = ar.kuzin@gmail.com
+#[sendemail]
+#    smtpserver = msmtp
+#    confirm = always
+EOF
+
+RUN cat > ~/.tmux.conf <<'EOF'
+set -g mouse on
+set -g default-terminal "tmux-256color"
+set -g history-limit 10000
+EOF
+
+# --- Rust toolchain -----------------------------------------------------------------
+ENV RUSTUP_HOME=/home/${USERNAME}/.rustup \
+    CARGO_HOME=/home/${USERNAME}/.cargo \
+    PATH=/home/${USERNAME}/.cargo/bin:${PATH}
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+        --default-toolchain stable --profile minimal \
+ && rustup component add rustfmt clippy rust-src rust-analyzer \
+ && rustup toolchain install nightly --profile minimal --component rustfmt \
+ && cargo install --locked bindgen-cli \
+ && ccache --set-config=max_size=20G
+
+# Optional extra Rust tooling (uncomment as needed):
+#RUN cargo install --locked sccache cargo-expand cargo-deny
+# Cross userspace targets (also needs a linker — see cross-toolchain block):
+#RUN rustup target add x86_64-unknown-linux-gnu
+
+# Route gcc/g++/clang through ccache transparently (big win on kernel rebuilds)
+ENV PATH=/usr/lib/ccache:${PATH}
+
+# --- Node.js 24 via nvm -------------------------------------------------------------
+# nvm is bash-only; Ubuntu RUNs default to dash
+SHELL ["/bin/bash", "-c"]
+
+ENV NVM_DIR=/home/${USERNAME}/.nvm
+RUN mkdir -p "$NVM_DIR" \
+ && curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash \
+ && . "$NVM_DIR/nvm.sh" \
+ && nvm install 24 \
+ && nvm alias default 24 \
+ && ln -sfn "$NVM_DIR/versions/node/$(node -v)" "$NVM_DIR/current" \
+ && node -v \
+ && npm -v
+ENV PATH="${NVM_DIR}/current/bin:${PATH}"
+
+# --- Claude Code CLI -------------------------------------------------------------
+ENV DISABLE_AUTOUPDATER=1 \
+    PATH=/home/${USERNAME}/.local/bin:${PATH}
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+ && claude --version
+
+WORKDIR /workspace
+CMD ["/bin/bash"]
